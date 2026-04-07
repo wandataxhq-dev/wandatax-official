@@ -1,99 +1,82 @@
 import { createClient } from '@supabase/supabase-js';
 
-// Initialize Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL, 
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+// 🌍 Translation Dictionary
+const content = {
+  EN: {
+    niu_explanation: "Hey there, let’s get you ready for your Attestation of Tax Conformity (ACF). Do you already have a National Identifier Number (NIU)? \n\nJust a heads up: Your NIU is NOT your ID card number. Think of it as your 'tax birth certificate'—it’s a unique number given to you by the Directorate General of Taxation (DGI) that identifies you for business.",
+    ask_language: "Hey there, before we get to work on sorting out your taxes, which language do you prefer? / Avant de commencer à gérer vos impôts, quelle langue préférez-vous? \n\n1. English \n2. Français",
+    error: "Oops, something went wrong. Let's try that again."
+  },
+  FR: {
+    niu_explanation: "Hey there, préparons votre Attestation de Conformité Fiscale (ACF). Avez-vous déjà un Numéro d'Identifiant Unique (NIU) ? \n\nNotez bien : Votre NIU n'est PAS le numéro de votre carte d'identité. C'est comme un 'acte de naissance fiscal'—un numéro unique délivré par la Direction Générale des Impôts (DGI) pour vous identifier.",
+  }
+};
 
 export default async function handler(req, res) {
-  // 1. GET: Handle Meta Webhook Verification Handshake
-  if (req.method === 'GET') {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
+  if (req.method === 'GET') return res.status(200).send(req.query['hub.challenge']);
 
-    // Ensure this matches the 'Verify Token' in your Meta Dashboard
-    if (mode === 'subscribe' && token === 'WandaVerify123') {
-      return res.status(200).send(challenge);
-    }
-    return res.status(403).end();
-  }
-
-  // 2. POST: Handle Incoming WhatsApp Messages
   if (req.method === 'POST') {
     try {
       const value = req.body?.entry?.[0]?.changes?.[0]?.value;
       const message = value?.messages?.[0];
+      if (!message) return res.status(200).send('OK');
 
-      if (!message) {
-        return res.status(200).send('No Message');
-      }
-
-      const from = message.from; // Incoming raw number
+      const from = message.from;
       const text = message.text?.body || "";
-      
-      // Extract amount (e.g., "Momo 5000" -> 5000)
-      const amount = parseInt(text.replace(/\D/g, '')) || 0;
 
-      // --- STEP A: SYNC TO SUPABASE ---
-      const { error: dbError } = await supabase
-        .from('transactions')
-        .insert([{ 
-          phone_number: from, 
-          amount: amount, 
-          raw_text: text 
-        }]);
+      // 1. Check User Profile in Supabase
+      let { data: profile } = await supabase.from('profiles').select('*').eq('phone_number', from).single();
 
-      if (dbError) {
-        console.error("❌ Supabase Sync Error:", dbError.message);
-      }
-
-      // --- STEP B: FORMAT NUMBER FOR META REPLY ---
-      // We force it to +237670791352 to match your whitelisted format
-      let cleanNumber = from.replace(/\D/g, ''); 
-      if (!cleanNumber.startsWith('237')) {
-          cleanNumber = '237' + cleanNumber;
-      }
-      // Ensure the '6' is present after '237' if missing
-      if (cleanNumber.startsWith('237') && !cleanNumber.startsWith('2376')) {
-          cleanNumber = cleanNumber.replace('237', '2376');
-      }
-      const finalRecipient = `+${cleanNumber}`;
-
-      // --- STEP C: SEND WHATSAPP CONFIRMATION ---
-      const whatsappResult = await fetch(
-        `https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            messaging_product: "whatsapp",
-            to: finalRecipient,
-            type: "text",
-            text: { body: `✅ WandaTax: ${amount} CFA logged to Supabase.` },
-          }),
+      // 2. New User / Language Selection
+      if (!profile || !profile.preferred_language) {
+        if (!profile) {
+          await supabase.from('profiles').insert([{ phone_number: from, onboarding_step: 'AWAITING_LANGUAGE' }]);
         }
-      );
+        
+        // Handle incoming language choice
+        if (text.includes('1') || text.toLowerCase().includes('eng')) {
+          await supabase.from('profiles').update({ preferred_language: 'EN', onboarding_step: 'ASK_NIU' }).eq('phone_number', from);
+          return sendReply(from, content.EN.niu_explanation);
+        } else if (text.includes('2') || text.toLowerCase().includes('fra')) {
+          await supabase.from('profiles').update({ preferred_language: 'FR', onboarding_step: 'ASK_NIU' }).eq('phone_number', from);
+          return sendReply(from, content.FR.niu_explanation);
+        } else {
+          return sendReply(from, content.EN.ask_language); // Default bilingual prompt
+        }
+      }
 
-      const result = await whatsappResult.json();
+      // 3. Logic for existing users (Transactions or Onboarding)
+      const lang = profile.preferred_language || 'EN';
       
-      if (!whatsappResult.ok) {
-        console.error("❌ Meta API Error Detail:", JSON.stringify(result));
-      } else {
-        console.log(`📡 Reply successfully sent to ${finalRecipient}`);
+      // If the user is just logging a transaction:
+      const amount = parseInt(text.replace(/\D/g, '')) || 0;
+      if (amount > 0) {
+        await supabase.from('transactions').insert([{ phone_number: from, amount, raw_text: text }]);
+        const reply = lang === 'EN' 
+          ? `✅ WandaTax: ${amount} CFA logged to Supabase.` 
+          : `✅ WandaTax : ${amount} CFA enregistré dans Supabase.`;
+        return sendReply(from, reply);
       }
 
       return res.status(200).send('OK');
-
     } catch (err) {
-      console.error("🔥 System Crash:", err.message);
-      return res.status(200).send('Caught Error');
+      console.error(err);
+      return res.status(200).send('Error');
     }
   }
+}
 
-  return res.status(405).end();
+async function sendReply(to, text) {
+  // Format number for Cameroon (+2376...)
+  let cleanNumber = to.replace(/\D/g, '');
+  if (!cleanNumber.startsWith('237')) cleanNumber = '237' + cleanNumber;
+  if (cleanNumber.startsWith('237') && !cleanNumber.startsWith('2376')) cleanNumber = cleanNumber.replace('237', '2376');
+
+  return fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messaging_product: "whatsapp", to: `+${cleanNumber}`, type: "text", text: { body: text } })
+  });
 }
