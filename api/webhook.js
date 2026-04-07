@@ -2,20 +2,19 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-// 🌍 Internationalization Helper
 const translations = {
   EN: {
     welcome: "Hey there, before we get to work on sorting out your taxes, which language do you prefer? / Avant de commencer à gérer vos impôts, quelle langue préférez-vous? \n\n1. English \n2. Français",
     niu_check: "Perfect! Let’s get you ready for your Attestation of Tax Conformity (ACF). Do you already have a National Identifier Number (NIU)? \n\n(Note: Your NIU is NOT your ID card number. It is a unique 'tax birth certificate' issued by the Directorate General of Taxation (DGI).)",
     ask_number: "Great! Please send me your 14-digit National Identifier Number (NIU) so I can verify your profile.",
     ask_cni: "No worries, I'll help you get one. To start your registration with the Directorate General of Taxation (DGI), please send me a clear photo of your National Identity Card (CNI).",
-    logged: (amount) => `✅ WandaTax: ${amount} CFA logged to Supabase.`
+    logged: (amount) => `✅ WandaTax: ${amount} CFA logged.`
   },
   FR: {
     niu_check: "Parfait ! Préparons votre Attestation de Conformité Fiscale (ACF). Avez-vous déjà un Numéro d'Identifiant Unique (NIU) ? \n\n(Note : Votre NIU n'est PAS le numéro de votre carte d'identité. C'est un 'acte de naissance fiscal' unique délivré par la Direction Générale des Impôts (DGI).)",
     ask_number: "Super ! Veuillez m'envoyer votre Numéro d'Identifiant Unique (NIU) à 14 chiffres pour que je puisse vérifier votre profil.",
     ask_cni: "Pas de soucis, je vais vous aider à en obtenir un. Pour commencer votre enregistrement auprès de la Direction Générale des Impôts (DGI), veuillez m'envoyer une photo claire de votre Carte Nationale d'Identité (CNI).",
-    logged: (amount) => `✅ WandaTax : ${amount} CFA enregistré dans Supabase.`
+    logged: (amount) => `✅ WandaTax : ${amount} CFA enregistré.`
   }
 };
 
@@ -23,7 +22,6 @@ export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send(req.query['hub.challenge']);
 
   if (req.method === 'POST') {
-    // Tell Meta immediately to stop the retry loop
     res.status(200).send('EVENT_RECEIVED');
 
     try {
@@ -33,17 +31,24 @@ export default async function handler(req, res) {
 
       const from = message.from;
       const text = (message.text?.body || "").trim();
-      const msgType = message.type;
+      
+      console.log(`📩 Incoming from ${from}: "${text}"`);
 
-      // 1. Fetch User Profile
-      let { data: profile } = await supabase.from('profiles').select('*').eq('phone_number', from).maybeSingle();
+      // 1. Get or Create Profile
+      let { data: profile, error } = await supabase.from('profiles').select('*').eq('phone_number', from).maybeSingle();
 
-      // 2. Initial Onboarding (Language Choice)
-      if (!profile || !profile.preferred_language) {
-        if (!profile) {
-          await supabase.from('profiles').insert([{ phone_number: from, onboarding_step: 'START' }]);
-        }
-        
+      if (!profile) {
+        console.log(`🆕 Creating new profile for ${from}`);
+        const { data: newProfile, error: insertError } = await supabase
+          .from('profiles')
+          .insert([{ phone_number: from, onboarding_step: 'START' }])
+          .select()
+          .single();
+        profile = newProfile;
+      }
+
+      // 2. Language Selection (The Gatekeeper)
+      if (!profile.preferred_language) {
         if (text === '1' || text.toLowerCase().includes('eng')) {
           await supabase.from('profiles').update({ preferred_language: 'EN', onboarding_step: 'ASK_NIU' }).eq('phone_number', from);
           return sendReply(from, translations.EN.niu_check);
@@ -55,12 +60,12 @@ export default async function handler(req, res) {
         }
       }
 
-      const lang = profile.preferred_language || 'EN';
+      const lang = profile.preferred_language;
       const step = profile.onboarding_step;
 
-      // 3. NIU Branching Logic (Yes/No)
+      // 3. Onboarding Branching
       if (step === 'ASK_NIU') {
-        const hasNIU = text.toLowerCase().includes('yes') || text.toLowerCase().includes('oui');
+        const hasNIU = text.toLowerCase().includes('yes') || text.toLowerCase().includes('oui') || text === '1';
         if (hasNIU) {
           await supabase.from('profiles').update({ onboarding_step: 'AWAITING_NIU_NUMBER' }).eq('phone_number', from);
           return sendReply(from, translations[lang].ask_number);
@@ -70,31 +75,18 @@ export default async function handler(req, res) {
         }
       }
 
-      // 4. Handle Image Uploads (CNI Photos)
-      if (msgType === 'image' && step === 'AWAITING_CNI_PHOTO') {
-        const mediaId = message.image.id;
-        // Logic to download from Meta and upload to Supabase Storage goes here
-        const confirmation = lang === 'EN' 
-          ? "Got it! I see your ID card. Now, what is your father's full name? The DGI needs this for the registration."
-          : "Bien reçu ! J'ai votre carte d'identité. Maintenant, quel est le nom complet de votre père ? La DGI en a besoin pour l'enregistrement.";
-        
-        await supabase.from('profiles').update({ onboarding_step: 'AWAITING_FATHER_NAME', cni_photo_id: mediaId }).eq('phone_number', from);
-        return sendReply(from, confirmation);
-      }
-
-      // 5. General Expense Logging
+      // 4. Default Logging
       const amount = parseInt(text.replace(/\D/g, '')) || 0;
-      if (amount > 0 && msgType === 'text') {
+      if (amount > 0) {
         await supabase.from('transactions').insert([{ phone_number: from, amount, raw_text: text }]);
         return sendReply(from, translations[lang].logged(amount));
       }
 
     } catch (err) {
-      console.error("Critical Error:", err.message);
+      console.error("🔥 Webhook Crash:", err.message);
     }
     return;
   }
-  res.status(405).end();
 }
 
 async function sendReply(to, text) {
@@ -102,7 +94,9 @@ async function sendReply(to, text) {
   if (!cleanNumber.startsWith('237')) cleanNumber = '237' + cleanNumber;
   if (cleanNumber.startsWith('237') && !cleanNumber.startsWith('2376')) cleanNumber = cleanNumber.replace('237', '2376');
 
-  await fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+  console.log(`📡 Replying to ${cleanNumber}: "${text.substring(0, 20)}..."`);
+
+  return fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ messaging_product: "whatsapp", to: `+${cleanNumber}`, type: "text", text: { body: text } })
