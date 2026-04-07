@@ -1,53 +1,84 @@
-// api/webhook.js
 import { createClient } from '@supabase/supabase-js';
 
+// --- CONFIGURATION (Environment Variables) ---
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN = "WandaVerify123";
 
 export default async function handler(req, res) {
-  // 1. META VERIFICATION (The Handshake)
+  // 1. META HANDSHAKE (The Webhook Verification)
   if (req.method === 'GET') {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    if (mode === 'subscribe' && token === "WandaVerify123") {
+
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+      console.log("WEBHOOK_VERIFIED");
       return res.status(200).send(challenge);
     }
     return res.status(403).end();
   }
 
-  // 2. THE MESSAGE HANDLER
+  // 2. INCOMING MESSAGE HANDLER (The "Ear")
   if (req.method === 'POST') {
     const body = req.body;
-    const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const entry = body.entry?.[0]?.changes?.[0]?.value;
+    const message = entry?.messages?.[0];
 
     if (!message) return res.status(200).send('OK');
 
-    const from = message.from; // Customer Number
-    const text = message.text?.body || "";
+    const customerNumber = message.from;
+    const textContent = message.text?.body || "";
 
-    // MOMO/ORANGE SMS PARSER (The Shadow Accountant)
+    // A. MOMO/ORANGE SMS PARSER (The "Brain")
     const momoRegex = /(?:Confirmed|Transfer of|You have received)\s?([\d,.]+)\s?FCFA/i;
-    const isMomo = text.match(momoRegex);
+    const match = textContent.match(momoRegex);
 
-    if (isMomo) {
-      const amount = parseFloat(isMomo[1].replace(/,/g, ''));
-      const type = text.toLowerCase().includes('received') ? 'Income' : 'Expense';
+    if (match) {
+      const amount = parseFloat(match[1].replace(/,/g, ''));
+      const isIncome = textContent.toLowerCase().includes('received');
       
-      await reply(from, `🛡️ *WandaTax Shield*\n\nI detected a ${type} of *${amount.toLocaleString()} CFA*.\n\nI've added this to your tax-compliance ledger. You're staying audit-ready! ✅`);
-      // Add Supabase logic here next
+      const replyMsg = `🛡️ *WandaTax Shield*\n\nI detected a ${isIncome ? 'Income' : 'Expense'} of *${amount.toLocaleString()} CFA* from your SMS.\n\nI've added this to your audit-ready ledger. ✅`;
+      
+      await sendWhatsApp(customerNumber, replyMsg);
+      // NOTE: Here is where we add the Supabase 'insert' logic next.
       return res.status(200).send('OK');
     }
 
-    // DEFAULT RESPONSE
-    await reply(from, "Welcome to WandaTax 🇨🇲. Forward a MoMo/Orange SMS to log it, or type an amount to start.");
+    // B. MANUAL LOGGING (Fallback)
+    if (!isNaN(parseFloat(textContent))) {
+       const amount = parseFloat(textContent.replace(/[^0-9]/g, ''));
+       await sendWhatsApp(customerNumber, `I see you logged *${amount.toLocaleString()} CFA*. What category is this? (Feature coming soon!)`);
+       return res.status(200).send('OK');
+    }
+
+    // C. DEFAULT GREETING
+    await sendWhatsApp(customerNumber, "Welcome to *WandaTax* 🇨🇲. Forward a MoMo/Orange SMS or type an amount to log it.");
     return res.status(200).send('OK');
   }
 }
 
-async function reply(to, text) {
-  await fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messaging_product: "whatsapp", to, text: { body: text } })
-  });
+// --- HELPER FUNCTION: Send WhatsApp Message ---
+async function sendWhatsApp(to, text) {
+  const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: to,
+        type: "text",
+        text: { body: text }
+      })
+    });
+    const data = await response.json();
+    console.log("WhatsApp API Response:", data);
+  } catch (error) {
+    console.error("Error sending WhatsApp:", error);
+  }
 }
