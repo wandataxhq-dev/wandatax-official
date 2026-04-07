@@ -1,34 +1,42 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL, 
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 export default async function handler(req, res) {
-  // 1. GET: Meta Webhook Verification
+  // 1. GET: Handle Meta Webhook Verification Handshake
   if (req.method === 'GET') {
-    return res.status(200).send(req.query['hub.challenge']);
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    // Ensure this matches the 'Verify Token' in your Meta Dashboard
+    if (mode === 'subscribe' && token === 'WandaVerify123') {
+      return res.status(200).send(challenge);
+    }
+    return res.status(403).end();
   }
 
-  // 2. POST: Receiving WhatsApp Data
+  // 2. POST: Handle Incoming WhatsApp Messages
   if (req.method === 'POST') {
     try {
-      // Navigate the Meta JSON tree carefully
       const value = req.body?.entry?.[0]?.changes?.[0]?.value;
       const message = value?.messages?.[0];
 
       if (!message) {
-        console.log("No message found in payload");
         return res.status(200).send('No Message');
       }
 
-      const from = message.from;
+      const from = message.from; // Incoming raw number
       const text = message.text?.body || "";
       
-      // Clean amount extraction: "Total 5000" -> 5000
+      // Extract amount (e.g., "Momo 5000" -> 5000)
       const amount = parseInt(text.replace(/\D/g, '')) || 0;
 
-      console.log(`Processing: ${amount} CFA from ${from}`);
-
-      // Sync to Supabase
+      // --- STEP A: SYNC TO SUPABASE ---
       const { error: dbError } = await supabase
         .from('transactions')
         .insert([{ 
@@ -37,9 +45,23 @@ export default async function handler(req, res) {
           raw_text: text 
         }]);
 
-      if (dbError) throw new Error(`Supabase Insert Failed: ${dbError.message}`);
+      if (dbError) {
+        console.error("❌ Supabase Sync Error:", dbError.message);
+      }
 
-      // Reply via WhatsApp
+      // --- STEP B: FORMAT NUMBER FOR META REPLY ---
+      // We force it to +237670791352 to match your whitelisted format
+      let cleanNumber = from.replace(/\D/g, ''); 
+      if (!cleanNumber.startsWith('237')) {
+          cleanNumber = '237' + cleanNumber;
+      }
+      // Ensure the '6' is present after '237' if missing
+      if (cleanNumber.startsWith('237') && !cleanNumber.startsWith('2376')) {
+          cleanNumber = cleanNumber.replace('237', '2376');
+      }
+      const finalRecipient = `+${cleanNumber}`;
+
+      // --- STEP C: SEND WHATSAPP CONFIRMATION ---
       const whatsappResult = await fetch(
         `https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`,
         {
@@ -50,22 +72,26 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify({
             messaging_product: "whatsapp",
-            to: from,
+            to: finalRecipient,
+            type: "text",
             text: { body: `✅ WandaTax: ${amount} CFA logged to Supabase.` },
           }),
         }
       );
 
+      const result = await whatsappResult.json();
+      
       if (!whatsappResult.ok) {
-        const errData = await whatsappResult.json();
-        console.error("Meta API Error:", JSON.stringify(errData));
+        console.error("❌ Meta API Error Detail:", JSON.stringify(result));
+      } else {
+        console.log(`📡 Reply successfully sent to ${finalRecipient}`);
       }
 
       return res.status(200).send('OK');
 
     } catch (err) {
-      console.error("System Crash:", err.message);
-      return res.status(200).send('Error but caught'); // Keep 200 so Meta doesn't retry
+      console.error("🔥 System Crash:", err.message);
+      return res.status(200).send('Caught Error');
     }
   }
 
