@@ -4,12 +4,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 const translations = {
   EN: {
-    kind_ask: "Hey there! 👋 I'm your WandaTax assistant. I help Cameroonians get their NIU and ACF easily. Would you like to start your tax compliance journey now? (Reply with 'Start', 'Register', or 'Taxes')",
-    welcome_prompt: "Hey there, before we get to work on sorting out your taxes, which language do you prefer? \n\n1. English \n2. Français",
-    niu_check: "Perfect! Let’s get you ready for your ACF. Do you already have a National Identifier Number (NIU)?",
-    ask_number: "Great! Please send me your 14-digit NIU.",
-    ask_cni: "No worries, please send me a clear photo of your CNI.",
-    logged: (amount) => `✅ WandaTax: ${amount} CFA logged.`
+    kind_ask: "Hey there! 👋 I'm your WandaTax assistant. I help Cameroonians get their NIU and ACF easily. Would you like to start? (Reply 'Start', 'Register', or 'Taxes')",
+    welcome_prompt: "Hey there, before we get to work on sorting out your taxes, which language do you prefer? / Avant de commencer à gérer vos impôts, quelle langue préférez-vous? \n\n1. English \n2. Français",
+    niu_check: "Perfect! Let’s get you ready for your ACF. Do you already have a National Identifier Number (NIU)?"
   }
 };
 
@@ -26,6 +23,7 @@ export default async function handler(req, res) {
 
       const from = message.from;
       const text = (message.text?.body || "").trim();
+      const lowerText = text.toLowerCase();
       
       // 1. NORMALIZE
       let normalizedFrom = from.replace(/\D/g, '');
@@ -34,43 +32,23 @@ export default async function handler(req, res) {
       }
       console.log(`🔍 Normalized: ${normalizedFrom}`);
 
-      // 2. DATABASE (Silent Failure Mode)
-      let profile = null;
-      try {
-        const { data } = await supabase.from('profiles').select('*').eq('phone_number', normalizedFrom).maybeSingle();
-        profile = data;
-        
-        if (!profile) {
-          const { data: newP } = await supabase.from('profiles').insert([{ phone_number: normalizedFrom, onboarding_step: 'START' }]).select().single();
-          profile = newP;
-        }
-      } catch (dbErr) {
-        console.error("⚠️ DB Error (Ignoring to send reply):", dbErr.message);
-      }
-
-      // 3. FORCE REPLY LOGIC
-      // If DB failed or no language, send the Kind Ask or Welcome
-      const lowerText = text.toLowerCase();
+      // 2. IMMEDIATE REPLY (Don't wait for Supabase!)
       const triggers = ['start', 'register', 'taxes'];
-
-      if (!profile || !profile.preferred_language) {
-        if (text === '1' || lowerText.includes('eng')) {
-          // Try to update DB, but don't wait for it to send reply
-          supabase.from('profiles').update({ preferred_language: 'EN', onboarding_step: 'ASK_NIU' }).eq('phone_number', normalizedFrom).then();
-          return await sendReply(normalizedFrom, translations.EN.niu_check);
-        } 
-        
-        if (triggers.includes(lowerText)) {
-          return await sendReply(normalizedFrom, translations.EN.welcome_prompt);
-        } else {
-          return await sendReply(normalizedFrom, translations.EN.kind_ask);
-        }
+      if (triggers.includes(lowerText)) {
+        await sendReply(normalizedFrom, translations.EN.welcome_prompt);
+      } else {
+        await sendReply(normalizedFrom, translations.EN.kind_ask);
       }
 
-      // 4. ONBOARDING (If language exists)
-      if (profile.onboarding_step === 'ASK_NIU') {
-        return await sendReply(normalizedFrom, translations.EN.ask_number);
-      }
+      // 3. BACKGROUND DATABASE SYNC (Fire and Forget)
+      console.log(`⏳ Attempting background DB sync...`);
+      supabase.from('profiles').upsert(
+        { phone_number: normalizedFrom, onboarding_step: 'START' },
+        { onConflict: 'phone_number' }
+      ).then(({ error }) => {
+        if (error) console.error("❌ DB Background Error:", error.message);
+        else console.log("✅ DB Sync Successful");
+      });
 
     } catch (err) {
       console.error("🔥 Global Catch:", err.message);
@@ -79,16 +57,24 @@ export default async function handler(req, res) {
 }
 
 async function sendReply(to, text) {
-  console.log(`📡 Sending to +${to}...`);
+  console.log(`📡 Sending reply to +${to}`);
   try {
     const response = await fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: "whatsapp", to: `+${to}`, type: "text", text: { body: text } })
+      headers: { 
+        'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`, 
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({ 
+        messaging_product: "whatsapp", 
+        to: `+${to}`, 
+        type: "text", 
+        text: { body: text } 
+      })
     });
     const result = await response.json();
-    console.log(`✅ Meta API Status:`, result.messaging_product ? "SUCCESS" : "FAILED", JSON.stringify(result));
+    console.log(`✅ Meta API Result:`, JSON.stringify(result));
   } catch (e) {
-    console.error("❌ Fetch failed:", e.message);
+    console.error("❌ WhatsApp Fetch failed:", e.message);
   }
 }
