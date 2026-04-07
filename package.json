@@ -4,6 +4,10 @@
   "type": "module",
   "description": "WhatsApp-based Tax Compliance OS for Cameroon",
   "main": "api/webhook.js",
+  "scripts": {
+    "check": "node --check api/webhook.js && node --check api/parser.js && node --check api/reports/daily.js && node --check api/profiles.js && node --check api/admin/diag.js && node --check lib/whatsapp.js && node --check lib/admin.js && node --check lib/supabase.js && node --check lib/phone.js",
+    "dev": "vercel dev"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
     "node-fetch": "^3.3.2"
