@@ -17,71 +17,59 @@ export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send(req.query['hub.challenge']);
 
   if (req.method === 'POST') {
-    // 1. IMMEDIATE ACKNOWLEDGMENT (Prevents Meta from retrying and causing loops)
     res.status(200).send('EVENT_RECEIVED');
 
     try {
       const value = req.body?.entry?.[0]?.changes?.[0]?.value;
       const message = value?.messages?.[0];
-      
-      // CRITICAL: Only process incoming TEXT messages from users (ignore bot's own status updates)
       if (!message || message.type !== 'text') return;
 
       const from = message.from;
       const text = (message.text?.body || "").trim();
-      const lowerText = text.toLowerCase();
-
-      console.log(`⭐ Processing message from ${from}: "${text}"`);
-
-      // 2. NORMALIZE NUMBER (Handle the Cameroon 6)
+      
+      // 1. NORMALIZE
       let normalizedFrom = from.replace(/\D/g, '');
       if (normalizedFrom.startsWith('237') && !normalizedFrom.startsWith('2376')) {
         normalizedFrom = normalizedFrom.replace('237', '2376');
       }
-      console.log(`🔍 Normalized number to: ${normalizedFrom}`);
+      console.log(`🔍 Normalized: ${normalizedFrom}`);
 
-      // 3. DATABASE CHECK (With Fail-Safe)
+      // 2. DATABASE (Silent Failure Mode)
       let profile = null;
       try {
-        let { data } = await supabase.from('profiles').select('*').eq('phone_number', normalizedFrom).maybeSingle();
+        const { data } = await supabase.from('profiles').select('*').eq('phone_number', normalizedFrom).maybeSingle();
         profile = data;
-
+        
         if (!profile) {
-          console.log(`🆕 Creating profile for ${normalizedFrom}`);
           const { data: newP } = await supabase.from('profiles').insert([{ phone_number: normalizedFrom, onboarding_step: 'START' }]).select().single();
           profile = newP;
         }
       } catch (dbErr) {
-        console.error("❌ Supabase Error:", dbErr.message);
-        // If DB fails, we still want to try sending the welcome message
+        console.error("⚠️ DB Error (Ignoring to send reply):", dbErr.message);
       }
 
-      // 4. TRIGGER WORDS
+      // 3. FORCE REPLY LOGIC
+      // If DB failed or no language, send the Kind Ask or Welcome
+      const lowerText = text.toLowerCase();
       const triggers = ['start', 'register', 'taxes'];
-      const isTrigger = triggers.includes(lowerText);
 
-      // 5. THE "KIND ASK" & LANGUAGE FLOW
       if (!profile || !profile.preferred_language) {
         if (text === '1' || lowerText.includes('eng')) {
-          await supabase.from('profiles').update({ preferred_language: 'EN', onboarding_step: 'ASK_NIU' }).eq('phone_number', normalizedFrom);
+          // Try to update DB, but don't wait for it to send reply
+          supabase.from('profiles').update({ preferred_language: 'EN', onboarding_step: 'ASK_NIU' }).eq('phone_number', normalizedFrom).then();
           return await sendReply(normalizedFrom, translations.EN.niu_check);
-        } else if (isTrigger) {
+        } 
+        
+        if (triggers.includes(lowerText)) {
           return await sendReply(normalizedFrom, translations.EN.welcome_prompt);
         } else {
           return await sendReply(normalizedFrom, translations.EN.kind_ask);
         }
       }
 
-      // 6. ONBOARDING STEPS
-      const step = profile.onboarding_step;
-      if (step === 'ASK_NIU') {
-        if (lowerText.includes('yes') || text === '1') {
-          await supabase.from('profiles').update({ onboarding_step: 'AWAITING_NIU_NUMBER' }).eq('phone_number', normalizedFrom);
-          return await sendReply(normalizedFrom, translations.EN.ask_number);
-        } else {
-          await supabase.from('profiles').update({ onboarding_step: 'AWAITING_CNI_PHOTO' }).eq('phone_number', normalizedFrom);
-          return await sendReply(normalizedFrom, translations.EN.ask_cni);
-        }
+      // 4. ONBOARDING (If language exists)
+      if (profile.onboarding_step === 'ASK_NIU') {
+        return await sendReply(normalizedFrom, translations.EN.ask_number);
       }
 
     } catch (err) {
@@ -91,22 +79,16 @@ export default async function handler(req, res) {
 }
 
 async function sendReply(to, text) {
-  // Always ensure the outgoing 'to' has the correct prefix
-  let cleanNumber = to.replace(/\D/g, '');
-  if (!cleanNumber.startsWith('237')) cleanNumber = '237' + cleanNumber;
-  if (cleanNumber.startsWith('237') && !cleanNumber.startsWith('2376')) cleanNumber = cleanNumber.replace('237', '2376');
-  
-  console.log(`📡 Outgoing Reply to +${cleanNumber}`);
-
+  console.log(`📡 Sending to +${to}...`);
   try {
     const response = await fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: "whatsapp", to: `+${cleanNumber}`, type: "text", text: { body: text } })
+      body: JSON.stringify({ messaging_product: "whatsapp", to: `+${to}`, type: "text", text: { body: text } })
     });
     const result = await response.json();
-    console.log(`✅ WhatsApp API Response:`, JSON.stringify(result));
-  } catch (fetchErr) {
-    console.error("❌ Fetch Error:", fetchErr.message);
+    console.log(`✅ Meta API Status:`, result.messaging_product ? "SUCCESS" : "FAILED", JSON.stringify(result));
+  } catch (e) {
+    console.error("❌ Fetch failed:", e.message);
   }
 }
