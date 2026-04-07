@@ -22,6 +22,7 @@ export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send(req.query['hub.challenge']);
 
   if (req.method === 'POST') {
+    // 1. Tell Meta we got it!
     res.status(200).send('EVENT_RECEIVED');
 
     try {
@@ -31,61 +32,57 @@ export default async function handler(req, res) {
 
       const from = message.from;
       const text = (message.text?.body || "").trim();
-      
-      console.log(`📩 Incoming from ${from}: "${text}"`);
 
-      // 1. Get or Create Profile
-      let { data: profile, error } = await supabase.from('profiles').select('*').eq('phone_number', from).maybeSingle();
+      // 2. Try Supabase but don't let it kill the bot
+      let profile = null;
+      try {
+        let { data } = await supabase.from('profiles').select('*').eq('phone_number', from).maybeSingle();
+        profile = data;
 
-      if (!profile) {
-        console.log(`🆕 Creating new profile for ${from}`);
-        const { data: newProfile, error: insertError } = await supabase
-          .from('profiles')
-          .insert([{ phone_number: from, onboarding_step: 'START' }])
-          .select()
-          .single();
-        profile = newProfile;
+        if (!profile) {
+          const { data: newP } = await supabase.from('profiles').insert([{ phone_number: from, onboarding_step: 'START' }]).select().single();
+          profile = newP;
+        }
+      } catch (dbErr) {
+        console.error("Database Error:", dbErr.message);
+        // We continue anyway to at least send the welcome message
       }
 
-      // 2. Language Selection (The Gatekeeper)
-      if (!profile.preferred_language) {
+      // 3. Logic - Fallback to Welcome if no language
+      if (!profile || !profile.preferred_language) {
         if (text === '1' || text.toLowerCase().includes('eng')) {
           await supabase.from('profiles').update({ preferred_language: 'EN', onboarding_step: 'ASK_NIU' }).eq('phone_number', from);
-          return sendReply(from, translations.EN.niu_check);
+          return await sendReply(from, translations.EN.niu_check);
         } else if (text === '2' || text.toLowerCase().includes('fra')) {
           await supabase.from('profiles').update({ preferred_language: 'FR', onboarding_step: 'ASK_NIU' }).eq('phone_number', from);
-          return sendReply(from, translations.FR.niu_check);
+          return await sendReply(from, translations.FR.niu_check);
         } else {
-          return sendReply(from, translations.EN.welcome);
+          return await sendReply(from, translations.EN.welcome);
         }
       }
 
+      // 4. Branching Onboarding
       const lang = profile.preferred_language;
-      const step = profile.onboarding_step;
-
-      // 3. Onboarding Branching
-      if (step === 'ASK_NIU') {
-        const hasNIU = text.toLowerCase().includes('yes') || text.toLowerCase().includes('oui') || text === '1';
-        if (hasNIU) {
-          await supabase.from('profiles').update({ onboarding_step: 'AWAITING_NIU_NUMBER' }).eq('phone_number', from);
-          return sendReply(from, translations[lang].ask_number);
-        } else {
-          await supabase.from('profiles').update({ onboarding_step: 'AWAITING_CNI_PHOTO' }).eq('phone_number', from);
-          return sendReply(from, translations[lang].ask_cni);
-        }
+      if (profile.onboarding_step === 'ASK_NIU') {
+         if (text.toLowerCase().includes('yes') || text.toLowerCase().includes('oui') || text === '1') {
+            await supabase.from('profiles').update({ onboarding_step: 'AWAITING_NIU_NUMBER' }).eq('phone_number', from);
+            return await sendReply(from, translations[lang].ask_number);
+         } else {
+            await supabase.from('profiles').update({ onboarding_step: 'AWAITING_CNI_PHOTO' }).eq('phone_number', from);
+            return await sendReply(from, translations[lang].ask_cni);
+         }
       }
 
-      // 4. Default Logging
+      // 5. Amount Logging
       const amount = parseInt(text.replace(/\D/g, '')) || 0;
       if (amount > 0) {
         await supabase.from('transactions').insert([{ phone_number: from, amount, raw_text: text }]);
-        return sendReply(from, translations[lang].logged(amount));
+        return await sendReply(from, translations[lang].logged(amount));
       }
 
     } catch (err) {
-      console.error("🔥 Webhook Crash:", err.message);
+      console.error("Final Catch Error:", err.message);
     }
-    return;
   }
 }
 
@@ -93,8 +90,6 @@ async function sendReply(to, text) {
   let cleanNumber = to.replace(/\D/g, '');
   if (!cleanNumber.startsWith('237')) cleanNumber = '237' + cleanNumber;
   if (cleanNumber.startsWith('237') && !cleanNumber.startsWith('2376')) cleanNumber = cleanNumber.replace('237', '2376');
-
-  console.log(`📡 Replying to ${cleanNumber}: "${text.substring(0, 20)}..."`);
 
   return fetch(`https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`, {
     method: 'POST',
